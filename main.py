@@ -1,3 +1,8 @@
+# requirements differences:
+# - python 3.7
+# - pytorch 1
+# - logger: Wandb
+
 import argparse
 import os
 import torch
@@ -10,6 +15,15 @@ import time
 from dataloader import listflowfile as lt
 from dataloader import SecenFlowLoader as DA
 import utils.logger as logger
+
+# ==== new imports === #
+import numpy as np
+import wandb
+
+# ==== fix seeds === #
+torch.manual_seed(0)
+np.random.seed(0)
+
 
 import models.anynet
 
@@ -43,9 +57,22 @@ parser.add_argument('--spn_init_channels', type=int, default=8, help='initial ch
 
 args = parser.parse_args()
 
+# =========================== set device ============================== #
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+
+# ============ LOGGER ============ #
+wandb.init(project="CLONED_ANYNET_MAIN")
+wandb.config.update(args)
+
 
 def main():
     global args
+
+    # ==== INFO ==== #
+    print(torch.__version__)
+    print('running on: ', device)
+    print('running gpus: ', torch.cuda.device_count())
 
     train_left_img, train_right_img, train_left_disp, test_left_img, test_right_img, test_left_disp = lt.dataloader(
         args.datapath)
@@ -65,7 +92,7 @@ def main():
         log.info(str(key) + ': ' + str(value))
 
     model = models.anynet.AnyNet(args)
-    model = nn.DataParallel(model).cuda()
+    model = nn.DataParallel(model).to(device)  #.cuda()
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
     log.info('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -111,9 +138,9 @@ def train(dataloader, model, optimizer, log, epoch=0):
     model.train()
 
     for batch_idx, (imgL, imgR, disp_L) in enumerate(dataloader):
-        imgL = imgL.float().cuda()
-        imgR = imgR.float().cuda()
-        disp_L = disp_L.float().cuda()
+        imgL = imgL.float().to(device)      # .cuda()
+        imgR = imgR.float().to(device)      # .cuda()
+        disp_L = disp_L.float().to(device)  # .cuda()
 
         optimizer.zero_grad()
         mask = disp_L < args.maxdisp
@@ -128,14 +155,33 @@ def train(dataloader, model, optimizer, log, epoch=0):
         for idx in range(stages):
             losses[idx].update(loss[idx].item()/args.loss_weights[idx])
 
-        if batch_idx % args.print_freq:
+        # ============ new logs ============================================= #
+        if not batch_idx % 450:
+            wandb.log({"train left RGB":      (wandb.Image(imgL[0])),
+                       "train disp stage 1":  (wandb.Image(outputs[0][0])),
+                       "train disp stage 2":  (wandb.Image(outputs[1][0])),
+                       "train disp stage 3":  (wandb.Image(outputs[2][0])),
+                       "train disp gt":       (wandb.Image(disp_L[0])),
+                        })
+
+        if not batch_idx % args.print_freq:
             info_str = ['Stage {} = {:.2f}({:.2f})'.format(x, losses[x].val, losses[x].avg) for x in range(stages)]
             info_str = '\t'.join(info_str)
+
+            # ============ new logs ======================== #
+            wandb.log({"train loss stage 1": losses[0].val,
+                       "train loss stage 2": losses[1].val,
+                       "train loss stage 3": losses[2].val})
 
             log.info('Epoch{} [{}/{}] {}'.format(
                 epoch, batch_idx, length_loader, info_str))
     info_str = '\t'.join(['Stage {} = {:.2f}'.format(x, losses[x].avg) for x in range(stages)])
     log.info('Average train loss = ' + info_str)
+
+    # ============ new logs ================================= #
+    wandb.log({"final avg train loss stage 1": losses[0].avg,
+               "final avg train loss stage 2": losses[1].avg,
+               "final avg train loss stage 3": losses[2].avg})
 
 
 def test(dataloader, model, log):
@@ -146,14 +192,20 @@ def test(dataloader, model, log):
 
     model.eval()
 
+    inference_time = []
     for batch_idx, (imgL, imgR, disp_L) in enumerate(dataloader):
-        imgL = imgL.float().cuda()
-        imgR = imgR.float().cuda()
-        disp_L = disp_L.float().cuda()
+        imgL = imgL.float().to(device)  # .cuda()
+        imgR = imgR.float().to(device)  # .cuda()
+        disp_L = disp_L.float().to(device)  # .cuda()
 
         mask = disp_L < args.maxdisp
         with torch.no_grad():
+
+            # === take time === #
+            time_before = time.time()
             outputs = model(imgL, imgR)
+            inference_time.append(time.time() - time_before)
+
             for x in range(stages):
                 if len(disp_L[mask]) == 0:
                     EPEs[x].update(0)
@@ -162,13 +214,36 @@ def test(dataloader, model, log):
                 output = output[:, 4:, :]
                 EPEs[x].update((output[mask] - disp_L[mask]).abs().mean())
 
+        # ================= new logs ===================================== #
+        if not batch_idx % 100:
+            wandb.log({"test left RGB":  (wandb.Image(imgL[0])),
+                       "test disp stage 1":   (wandb.Image(outputs[0][0])),
+                       "test disp stage 2":   (wandb.Image(outputs[1][0])),
+                       "test disp stage 3":   (wandb.Image(outputs[2][0])),
+                       "test disp gt":  (wandb.Image(disp_L[0]))})
+
         info_str = '\t'.join(['Stage {} = {:.2f}({:.2f})'.format(x, EPEs[x].val, EPEs[x].avg) for x in range(stages)])
 
         log.info('[{}/{}] {}'.format(
             batch_idx, length_loader, info_str))
 
+        # ========== new logs ======================== #
+        wandb.log({"EPEs stage 1": EPEs[0].val,
+                   "EPEs stage 2": EPEs[1].val,
+                   "EPEs stage 3": EPEs[2].val,
+                   "avg EPEs stage 0": EPEs[0].avg,
+                   "avg EPEs stage 1": EPEs[1].avg,
+                   "avg EPEs stage 2": EPEs[2].avg})
+
     info_str = ', '.join(['Stage {}={:.2f}'.format(x, EPEs[x].avg) for x in range(stages)])
     log.info('Average test EPE = ' + info_str)
+
+    # ========== new logs ============================ #
+    wandb.log({"final avg EPEs stage 0": EPEs[0].avg,
+               "final avg EPEs stage 1": EPEs[1].avg,
+               "final avg EPEs stage 2": EPEs[2].avg,
+               "avg inference time": np.mean(inference_time)})
+
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""

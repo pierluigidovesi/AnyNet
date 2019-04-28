@@ -8,6 +8,8 @@ import math
 from .submodules import post_3dconvs,feature_extraction_conv
 import sys
 
+# =========================== set device ============================== #
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 class AnyNet(nn.Module):
     def __init__(self, args):
@@ -87,13 +89,22 @@ class AnyNet(nn.Module):
         grid = torch.cat((xx, yy), 1).float()
 
         if x.is_cuda:
-            grid = grid.cuda()
+            grid = grid.to(device)
         vgrid = Variable(grid)
         vgrid[:,:1,:,:] = vgrid[:,:1,:,:] - disp
 
         # scale grid to [-1,1]
-        vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :] / max(W - 1, 1) - 1.0
-        vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :] / max(H - 1, 1) - 1.0
+
+        # vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :] / max(W - 1, 1) - 1.0
+        # vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :] / max(H - 1, 1) - 1.0
+
+        # # # # # # # # # # # # # # # NO INPLACE! # # # # # # # # # # # # # # # #
+        update = torch.zeros_like(vgrid)
+        update[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :] / max(W - 1, 1) - 1.0
+        update[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :] / max(H - 1, 1) - 1.0
+        vgrid = vgrid + update
+        # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
 
         vgrid = vgrid.permute(0, 2, 3, 1)
         output = nn.functional.grid_sample(x, vgrid)
@@ -102,7 +113,7 @@ class AnyNet(nn.Module):
 
     def _build_volume_2d(self, feat_l, feat_r, maxdisp, stride=1):
         assert maxdisp % stride == 0  # Assume maxdisp is multiple of stride
-        cost = torch.zeros(feat_l.size()[0], maxdisp//stride, feat_l.size()[2], feat_l.size()[3]).cuda()
+        cost = torch.zeros(feat_l.size()[0], maxdisp//stride, feat_l.size()[2], feat_l.size()[3]).to(device)  # .cuda()
         for i in range(0, maxdisp, stride):
             cost[:, i//stride, :, :i] = feat_l[:, :, :, :i].abs().sum(1)
             if i > 0:
@@ -115,7 +126,8 @@ class AnyNet(nn.Module):
     def _build_volume_2d3(self, feat_l, feat_r, maxdisp, disp, stride=1):
         size = feat_l.size()
         batch_disp = disp[:,None,:,:,:].repeat(1, maxdisp*2-1, 1, 1, 1).view(-1,1,size[-2], size[-1])
-        batch_shift = torch.arange(-maxdisp+1, maxdisp).repeat(size[0])[:,None,None,None].cuda() * stride
+        # ========================================= casted float here =========================================== #
+        batch_shift = torch.arange(-maxdisp+1, maxdisp).repeat(size[0])[:,None,None,None].to(device).float() * stride  #.cuda()
         batch_disp = batch_disp - batch_shift
         batch_feat_l = feat_l[:,None,:,:,:].repeat(1,maxdisp*2-1, 1, 1, 1).view(-1,size[-3],size[-2], size[-1])
         batch_feat_r = feat_r[:,None,:,:,:].repeat(1,maxdisp*2-1, 1, 1, 1).view(-1,size[-3],size[-2], size[-1])
@@ -174,9 +186,10 @@ class AnyNet(nn.Module):
 class disparityregression2(nn.Module):
     def __init__(self, start, end, stride=1):
         super(disparityregression2, self).__init__()
-        self.disp = Variable(torch.arange(start*stride, end*stride, stride).view(1, -1, 1, 1).cuda(), requires_grad=False)
+        self.disp = Variable(torch.arange(start*stride, end*stride, stride).view(1, -1, 1, 1).to(device), requires_grad=False) # .cuda()
 
     def forward(self, x):
-        disp = self.disp.repeat(x.size()[0], 1, x.size()[2], x.size()[3])
+        # ==================== casted float() ================================== #
+        disp = self.disp.repeat(x.size()[0], 1, x.size()[2], x.size()[3]).float()
         out = torch.sum(x * disp, 1, keepdim=True)
         return out

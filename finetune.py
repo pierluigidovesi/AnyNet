@@ -11,6 +11,14 @@ from dataloader import KITTILoader as DA
 import utils.logger as logger
 import torch.backends.cudnn as cudnn
 
+# ==== new imports === #
+import numpy as np
+import wandb
+
+# ==== fix seeds === #
+torch.manual_seed(0)
+np.random.seed(0)
+
 import models.anynet
 
 parser = argparse.ArgumentParser(description='Anynet fintune on KITTI')
@@ -46,17 +54,29 @@ parser.add_argument('--start_epoch_for_spn', type=int, default=121)
 parser.add_argument('--pretrained', type=str, default='results/pretrained_anynet/checkpoint.tar',
                     help='pretrained model path')
 
-
 args = parser.parse_args()
+
+# =========================== set device ============================== #
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 if args.datatype == '2015':
     from dataloader import KITTIloader2015 as ls
 elif args.datatype == '2012':
     from dataloader import KITTIloader2012 as ls
 
+# ============ LOGGER ============ #
+wandb.init(project="CLONED_ANYNET_FINETUNE")
+wandb.config.update(args)
+
 
 def main():
     global args
+
+    # ==== INFO ==== #
+    print(torch.__version__)
+    print('running on: ', device)
+    print('running gpus: ', torch.cuda.device_count())
+
     log = logger.setup_logger(args.save_path + '/training.log')
 
     train_left_img, train_right_img, train_left_disp, test_left_img, test_right_img, test_left_disp = ls.dataloader(
@@ -76,7 +96,7 @@ def main():
         log.info(str(key) + ': ' + str(value))
 
     model = models.anynet.AnyNet(args)
-    model = nn.DataParallel(model).cuda()
+    model = nn.DataParallel(model).to(device)  # changed cuda
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
     log.info('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -134,9 +154,9 @@ def train(dataloader, model, optimizer, log, epoch=0):
     model.train()
 
     for batch_idx, (imgL, imgR, disp_L) in enumerate(dataloader):
-        imgL = imgL.float().cuda()
-        imgR = imgR.float().cuda()
-        disp_L = disp_L.float().cuda()
+        imgL = imgL.float().to(device)  # .cuda()
+        imgR = imgR.float().to(device)  # .cuda()
+        disp_L = disp_L.float().to(device) # .cuda()
 
         optimizer.zero_grad()
         mask = disp_L > 0
@@ -157,6 +177,14 @@ def train(dataloader, model, optimizer, log, epoch=0):
         sum(loss).backward()
         optimizer.step()
 
+        # ============ new logs ============================================= #
+        if not batch_idx % 10:
+            wandb.log({"train left RGB":  (wandb.Image(imgL[0])),
+                       "train disp stage 1":    (wandb.Image(outputs[0][0])),
+                       "train disp stage 2":    (wandb.Image(outputs[1][0])),
+                       "train disp stage 3":    (wandb.Image(outputs[2][0])),
+                       "train disp gt":         (wandb.Image(disp_L[0]))})
+
         for idx in range(num_out):
             losses[idx].update(loss[idx].item())
 
@@ -164,10 +192,21 @@ def train(dataloader, model, optimizer, log, epoch=0):
             info_str = ['Stage {} = {:.2f}({:.2f})'.format(x, losses[x].val, losses[x].avg) for x in range(num_out)]
             info_str = '\t'.join(info_str)
 
+            # ============ new logs ========================== #
+            wandb.log({"train loss stage 1": losses[0].val,
+                       "train loss stage 2": losses[1].val,
+                       "train loss stage 3": losses[2].val})
+
             log.info('Epoch{} [{}/{}] {}'.format(
                 epoch, batch_idx, length_loader, info_str))
     info_str = '\t'.join(['Stage {} = {:.2f}'.format(x, losses[x].avg) for x in range(stages)])
     log.info('Average train loss = ' + info_str)
+
+    # ============ new logs ================================== #
+    wandb.log({"final avg train loss stage 1": losses[0].avg,
+               "final avg train loss stage 2": losses[1].avg,
+               "final avg train loss stage 3": losses[2].avg})
+
 
 
 def test(dataloader, model, log):
@@ -178,13 +217,19 @@ def test(dataloader, model, log):
 
     model.eval()
 
+    inference_time = []
     for batch_idx, (imgL, imgR, disp_L) in enumerate(dataloader):
-        imgL = imgL.float().cuda()
-        imgR = imgR.float().cuda()
-        disp_L = disp_L.float().cuda()
+        imgL = imgL.float().to(device)  # .cuda()
+        imgR = imgR.float().to(device)  # .cuda()
+        disp_L = disp_L.float().to(device)  # .cuda()
 
         with torch.no_grad():
+
+            # === take time === #
+            time_before = time.time()
             outputs = model(imgL, imgR)
+            inference_time.append(time.time() - time_before)
+
             for x in range(stages):
                 output = torch.squeeze(outputs[x], 1)
                 D1s[x].update(error_estimating(output, disp_L).item())
@@ -194,8 +239,29 @@ def test(dataloader, model, log):
         log.info('[{}/{}] {}'.format(
             batch_idx, length_loader, info_str))
 
+        # ============ new logs ================================== #
+        wandb.log({"test left RGB":       (wandb.Image(imgL[0])),
+                   "test disp stage 1":   (wandb.Image(outputs[0][0])),
+                   "test disp stage 2":   (wandb.Image(outputs[1][0])),
+                   "test disp stage 3":   (wandb.Image(outputs[2][0])),
+                   "test disp gt":        (wandb.Image(disp_L[0])),
+                   "D1s stage 1":         D1s[0].val,
+                   "D1s stage 2":         D1s[1].val,
+                   "D1s stage 3":         D1s[2].val,
+                   "avg D1s stage 1":     D1s[0].avg,
+                   "avg D1s stage 2":     D1s[1].avg,
+                   "avg D1s stage 3":     D1s[2].avg,
+                   "inference time":      inference_time[-1]})
+
     info_str = ', '.join(['Stage {}={:.4f}'.format(x, D1s[x].avg) for x in range(stages)])
     log.info('Average test 3-Pixel Error = ' + info_str)
+
+    # ============ new logs ================================== #
+    wandb.log({"final avg D1s stage 0": D1s[0].avg,
+               "final avg D1s stage 1": D1s[1].avg,
+               "final avg D1s stage 2": D1s[2].avg,
+               "avg inference time":    np.mean(inference_time)})
+
 
 
 def error_estimating(disp, ground_truth, maxdisp=192):
