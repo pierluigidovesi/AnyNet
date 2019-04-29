@@ -1,6 +1,10 @@
-# Anytime Stereo Image Depth Estimation on Mobile Devices
+# AnyNet: PYTORCH 1 - CUDA 10 - WANDB-LOGS
 
-# Results and visual here: https://app.wandb.ai/pier/cloned_anynet_main
+# Results and visual [here](https://app.wandb.ai/pier/cloned_anynet_main)
+## [init channels analysis (sceneflow)](https://app.wandb.ai/pier/cloned_anynet_main/reports?view=pier%2Finit_channels%20sceneflow%20analysis) 
+## [init channels analysis (KITTI 2015)](https://app.wandb.ai/pier/cloned_anynet_finetune/reports?view=pier%2Finit_channels%20KITTI%20analysis) 
+
+___________________________________________________________________________________________________
 
 This repository contains the code (in PyTorch) for AnyNet introduced in the following paper
 
